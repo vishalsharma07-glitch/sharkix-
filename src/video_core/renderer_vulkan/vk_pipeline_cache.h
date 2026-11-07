@@ -137,7 +137,7 @@ public:
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath();
 
-    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) noexcept;
 
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline();
 
@@ -202,7 +202,7 @@ private:
     std::unordered_set<const GraphicsPipeline*> used_this_session;
     std::filesystem::path used_pipelines_filename;
     std::chrono::steady_clock::time_point used_pipelines_saved{};
-    void SaveUsedPipelines();
+    void SaveUsedPipelines(bool asynchronous = true);
 
     std::filesystem::path vulkan_pipeline_cache_filename;
     vk::PipelineCache vulkan_pipeline_cache;
@@ -213,6 +213,14 @@ private:
 
     Common::ThreadWorker workers;
     Common::ThreadWorker serialization_thread;
+    /// [9070xt] Builds pipelines a native draw is waiting for, ahead of the (FIFO, low
+    /// priority) worker queue that can hold hundreds of builds. Declared after graphics_cache:
+    /// destroyed first, so its threads are joined before any pipeline is.
+    Common::ThreadWorker urgent_workers;
+    /// [9070xt] Time native draws may still wait this frame for a pipeline being built.
+    std::chrono::microseconds native_wait_left{};
+    size_t native_skipped_draws{};
+    std::chrono::microseconds native_waited{};
     DynamicFeatures dynamic_features;
 
     /// Cached graphics pipelines boot skipped (not in used_pipelines) are built on background

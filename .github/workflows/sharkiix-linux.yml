@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - sharkiix-v3.1
+      - rx9070xt-perf
 
 permissions:
   contents: read
@@ -37,6 +38,9 @@ jobs:
         include:
           - platform: linux-x86_64
             runner: ubuntu-24.04
+          # [9070xt] Windows MSVC build (the Windows steps below were already in this workflow).
+          - platform: windows-x86_64
+            runner: windows-2022
 
     steps:
       - name: Check out source
@@ -417,6 +421,7 @@ jobs:
             }
           }
           windeployqt --release --no-translations build/release/bin/lichii.exe
+          Copy-Item dist/nx2_switches.txt build/release/bin/nx2_switches.txt
 
       # A dynamic MinGW build is not portable on its own: windeployqt6 brings the Qt libraries and
       # plugins, then every non-system DLL the binaries and those plugins pull in gets copied next to

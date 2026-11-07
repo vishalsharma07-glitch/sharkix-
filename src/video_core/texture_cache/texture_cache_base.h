@@ -133,6 +133,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
     bool native_thresholds_applied{};
     u64 native_critical_memory{};
+    // [9070xt] 3/4 of the device budget on 12 GB+ cards (0 = keep MaxCriticalMemory).
+    u64 large_budget_cap{};
     u64 native_expected_memory{};
     u64 budget_check_frames{};
     u32 seen_pressure_events{};   ///< Allocator pressure events already answered

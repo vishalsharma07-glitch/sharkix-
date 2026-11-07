@@ -390,6 +390,49 @@ namespace {
 // only kept every pipeline the title ever built in host memory (title 1: a 245 MB file, ~0.35 GB
 // of RAM for the session) and copied it whole at each save, which stalled frames; pipelines built
 // no slower without it.
+// [9070xt] Native draws (Switch 2 games) never skipped a draw whose pipeline was still building:
+// the scheduler thread built it inline, so the frame took as long as a full driver compile
+// (30-100+ ms spikes on a new effect or area). With asynchronous shaders on, such a draw now waits
+// at most a per-frame budget for an urgent build and is skipped for this frame if it is not
+// ready. Pipelines whose draws store to buffers/images or use transform feedback are never
+// skipped (the game may read their results). EDEN_NX2_NATIVE_ASYNC=0 restores the old behaviour.
+bool NativeAsyncDraws() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_NATIVE_ASYNC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// [9070xt] Total time all native draws of one frame may wait for building pipelines (default
+// 3000 us: most fast-linked GPL pipelines finish within it). EDEN_NX2_NATIVE_ASYNC_BUDGET_US.
+std::chrono::microseconds NativeAsyncBudget() {
+    static const std::chrono::microseconds budget = [] {
+        const char* value = std::getenv("EDEN_NX2_NATIVE_ASYNC_BUDGET_US");
+        const long long us = value != nullptr ? std::strtoll(value, nullptr, 10) : 3000;
+        return std::chrono::microseconds{std::clamp<long long>(us, 0, 100000)};
+    }();
+    return budget;
+}
+
+// [9070xt] Threads for urgent builds (EDEN_NX2_URGENT_PIPELINE_THREADS, default 2).
+size_t UrgentPipelineThreads() {
+    const char* value = std::getenv("EDEN_NX2_URGENT_PIPELINE_THREADS");
+    const unsigned long long count = value != nullptr ? std::strtoull(value, nullptr, 10) : 2;
+    return static_cast<size_t>(std::clamp<unsigned long long>(count, 1, 8));
+}
+
+// [9070xt] Frames a graphics pipeline may go unused before it is destroyed. Was 36000 (10 min at
+// 60 fps): coming back to an area after 10 minutes rebuilt all of its pipelines mid-game.
+// Default 216000 (1 h at 60 fps); EDEN_NX2_EVICT_PIPELINE_FRAMES=0 never evicts.
+u64 EvictPipelineFrames() {
+    static const u64 frames = [] {
+        const char* value = std::getenv("EDEN_NX2_EVICT_PIPELINE_FRAMES");
+        return value != nullptr ? static_cast<u64>(std::strtoull(value, nullptr, 10)) : u64{216000};
+    }();
+    return frames;
+}
+
 bool DriverCachesPipelines(const Device& device) {
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
@@ -419,7 +462,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
-                           Common::ThreadPlacement::Background) {
+                           Common::ThreadPlacement::Background),
+      urgent_workers(UrgentPipelineThreads(), "VkPipelineUrgent", {},
+                     Common::ThreadPlacement::Default) {
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     PipelineOptimizer::Instance().Start();
@@ -699,12 +744,15 @@ bool PreloadAllPipelines() {
     }();
     return all;
 }
+
 } // Anonymous namespace
 
 PipelineCache::~PipelineCache() {
     PipelineOptimizer::Instance().Stop();
     StopBackgroundPipelines();
-    SaveUsedPipelines();
+    // [9070xt] Let a queued asynchronous save finish before the final one writes the same file.
+    serialization_thread.WaitForRequests();
+    SaveUsedPipelines(false);
     if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
         SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                      CACHE_VERSION);
@@ -712,7 +760,7 @@ PipelineCache::~PipelineCache() {
     PipelineLibraryCache::Instance().Clear();
 }
 
-void PipelineCache::SaveUsedPipelines() {
+void PipelineCache::SaveUsedPipelines(bool asynchronous) {
     used_pipelines_saved = std::chrono::steady_clock::now();
     // A session too short to say what the game uses (a boot to the menu) keeps the old list.
     constexpr size_t MinimumUsed = 64;
@@ -735,13 +783,22 @@ void PipelineCache::SaveUsedPipelines() {
             next.try_emplace(hash, static_cast<u8>(age + 1));
         }
     }
-    std::ofstream file{used_pipelines_filename, std::ios::binary | std::ios::trunc};
-    const u32 count = static_cast<u32>(next.size());
-    file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
-    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (const auto& [hash, age] : next) {
-        file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
-        file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+    // [9070xt] The file write used to run on the GPU thread in the middle of a draw, every 15 s
+    // while new pipelines appear (antivirus scanning each write can make that tens of ms).
+    auto write = [path = used_pipelines_filename, next = std::move(next)] {
+        std::ofstream file{path, std::ios::binary | std::ios::trunc};
+        const u32 count = static_cast<u32>(next.size());
+        file.write(reinterpret_cast<const char*>(&UsedPipelinesMagic), sizeof(UsedPipelinesMagic));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& [hash, age] : next) {
+            file.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+            file.write(reinterpret_cast<const char*>(&age), sizeof(age));
+        }
+    };
+    if (asynchronous) {
+        serialization_thread.QueueWork(std::move(write));
+    } else {
+        write();
     }
 }
 
@@ -1141,6 +1198,15 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath() {
 
 void PipelineCache::TickFrame() {
     ++frame_count;
+    native_wait_left = NativeAsyncBudget();
+    if (frame_count % 600 == 0 && native_skipped_draws != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Native async pipelines: {} draws skipped while their pipeline built, {} ms "
+                 "waited (last 600 frames)",
+                 native_skipped_draws, native_waited.count() / 1000);
+        native_skipped_draws = 0;
+        native_waited = {};
+    }
     while (!evicted_pipelines.empty() && scheduler.IsFree(evicted_pipelines.front().first)) {
         evicted_pipelines.pop_front();
     }
@@ -1159,8 +1225,8 @@ void PipelineCache::EvictUnusedPipelines() {
     // Each built pipeline holds ~0.45 MB of driver memory and none was ever destroyed, so it grew
     // with every place a session went (title 1: 1,500 on its title screen alone). One unused for
     // this long is destroyed; it takes 2-3 ms to build again from the driver's pipeline cache.
-    constexpr u64 EvictAfterFrames = 36000;
-    if (frame_count <= EvictAfterFrames) {
+    const u64 EvictAfterFrames = EvictPipelineFrames();
+    if (EvictAfterFrames == 0 || frame_count <= EvictAfterFrames) {
         return;
     }
     const u64 cutoff = frame_count - EvictAfterFrames;
@@ -1213,12 +1279,33 @@ void PipelineCache::StopBackgroundPipelines() {
     background_workers.reset();
 }
 
-GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
+GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexcept {
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
     if (!use_asynchronous_shaders) {
         return pipeline;
+    }
+    if (maxwell3d->GetNativeMacroEngine().native_turing) {
+        if (!NativeAsyncDraws() || !pipeline->CanSkipWhileBuilding()) {
+            return pipeline; // built inline by the draw, as before
+        }
+        if (pipeline->TryMarkUrgent()) {
+            urgent_workers.QueueWork([pipeline] { pipeline->BuildNow(); });
+        }
+        if (native_wait_left.count() > 0) {
+            const auto begin = std::chrono::steady_clock::now();
+            const bool built = pipeline->WaitBuiltFor(native_wait_left);
+            const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - begin);
+            native_wait_left -= (std::min)(waited, native_wait_left);
+            native_waited += waited;
+            if (built) {
+                return pipeline;
+            }
+        }
+        ++native_skipped_draws;
+        return nullptr;
     }
     const auto& draw_state = maxwell3d->draw_manager.draw_state;
     const bool discard = CanDiscardPendingDraw(maxwell3d->GetNativeMacroEngine().native_turing,

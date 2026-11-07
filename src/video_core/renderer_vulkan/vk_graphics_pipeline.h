@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -163,6 +164,34 @@ public:
         return is_built.load(std::memory_order::relaxed);
     }
 
+    /// [9070xt] True when skipping a draw while this pipeline builds loses nothing the game can
+    /// read back later: no storage buffer / image stores and no transform feedback. Set in the
+    /// constructor, before the build is queued.
+    [[nodiscard]] bool CanSkipWhileBuilding() const noexcept {
+        return !writes_storage && key.state.xfb_enabled == 0;
+    }
+
+    /// [9070xt] Returns true the first time only: the caller then queues an urgent build.
+    [[nodiscard]] bool TryMarkUrgent() noexcept {
+        return !build_claimed.load(std::memory_order::relaxed) &&
+               !urgent_queued.exchange(true, std::memory_order::acq_rel);
+    }
+
+    /// [9070xt] Builds now on the calling thread unless another thread already claimed it.
+    void BuildNow() {
+        RunBuild();
+    }
+
+    /// [9070xt] Waits up to `timeout` for the build running elsewhere. True once built.
+    [[nodiscard]] bool WaitBuiltFor(std::chrono::microseconds timeout) {
+        if (IsBuilt()) {
+            return true;
+        }
+        std::unique_lock lock{build_mutex};
+        return build_condvar.wait_for(
+            lock, timeout, [this] { return is_built.load(std::memory_order::relaxed); });
+    }
+
     template <typename Spec>
     static auto MakeConfigureSpecFunc() {
         return [](GraphicsPipeline* pl, bool is_indexed) { return pl->ConfigureImpl<Spec>(is_indexed); };
@@ -236,6 +265,7 @@ private:
 
     std::function<void()> build_task;
     std::atomic_bool build_claimed{false};
+    std::atomic_bool urgent_queued{false}; ///< [9070xt] Urgent build queued once
     std::condition_variable build_condvar;
     std::mutex build_mutex;
     std::atomic_bool is_built{false};

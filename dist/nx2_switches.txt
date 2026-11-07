@@ -18,9 +18,9 @@ EDEN_NX2_FENCE_BATCH=1
 # 90-220 MB/s of buffers CPU never touches, causing heavy mutex contention and dropping FPS by ~38-63%.
 #EDEN_NX2_BUFFER_DOWNLOADS=1
 
-# Paces frame submission 2 frames ahead. Reduces frametime spikes, but adds ~1-2 frames of input latency.
-# Enable only if frame pacing stability is preferred over responsive controls.
-#EDEN_NX2_FRAMES_AHEAD=2
+# [RX 9070 XT tune] leave unset: running ahead can cause flicker / wrong geometry, and the
+# stock "=2" actually means "wait for every frame" (only "1" means ahead).
+#EDEN_NX2_FRAMES_AHEAD=1
 
 # --- sharkiix 3.1: shader parts (VK_EXT_graphics_pipeline_library) ---
 # On by default with AMD's Windows driver: each shader is compiled in reusable parts and linked
@@ -46,3 +46,45 @@ EDEN_NX2_FENCE_BATCH=1
 #EDEN_NX2_SPLIT_SKIP=1
 #EDEN_NX2_AUTO_STUB=1
 #EDEN_NX2_KEEP_ASTC=1
+
+# =====================================================================
+# RX 9070 XT + Ryzen 5 7600X tune for sharkiix 3.1.1 (9070xt patch build)
+# =====================================================================
+# --- Shaders: build everything at boot ---
+# By default 3.1.1 only rebuilds the pipelines you used recently. =1 builds EVERY pipeline the
+# cache has ever recorded at boot (boot takes longer, then no compile hitches in any area you
+# have visited before). With 3.1's shader parts (GPL) on your RX 9070 XT this boot is quick.
+EDEN_NX2_PRELOAD_ALL_PIPELINES=1
+# Pipelines the boot skips are built in the background instead of mid-frame.
+# 3 = a quarter of the 7600X's 12 threads; the rest stay for the game and GPU thread.
+EDEN_NX2_BACKGROUND_PIPELINES=1
+EDEN_NX2_BACKGROUND_PIPELINE_THREADS=3
+
+# --- Textures ---
+# This build keeps up to 3/4 of VRAM for textures on 12 GB+ cards by itself (the 5 GiB cap made
+# Ocarina's village delete/reload textures every ~20 s). Manual override, if ever needed:
+#EDEN_NX2_TC_EXPECTED_MIB=10240
+#EDEN_NX2_TC_CRITICAL_MIB=11264
+
+# --- Image stability ---
+# FSR sharpening on top of the temporal upscale makes grass/leaves/edges shimmer.
+# Too soft? use e.g. EDEN_NX2_TEMPORAL_SHARPEN=1.2 instead of off.
+EDEN_NX2_TEMPORAL_SHARPEN=off
+
+# =====================================================================
+# 9070xt patch build - frame-time spike fixes (new switches, defaults shown)
+# =====================================================================
+# Native (Switch 2) draws whose pipeline is still compiling: wait at most a short per-frame
+# budget for it, then skip that draw for this frame instead of freezing for the whole compile
+# (the 40-100 ms spikes on new effects/areas). Draws that write buffers/images the game may read
+# back are never skipped. Needs "asynchronous shader compilation" ON in Graphics > Advanced.
+# A new effect may appear a frame or two late the first time; 0 = old behaviour (freeze).
+#EDEN_NX2_NATIVE_ASYNC=1
+# Total time per frame native draws may wait for compiling pipelines (microseconds).
+# Lower = fewer spikes but more first-time pop-in; higher = the opposite.
+#EDEN_NX2_NATIVE_ASYNC_BUDGET_US=3000
+# Threads that build those pipelines first, ahead of the background queue (1-8).
+#EDEN_NX2_URGENT_PIPELINE_THREADS=2
+# Frames a pipeline may go unused before it is destroyed (was 36000 = 10 min: coming back to an
+# area after 10 minutes rebuilt everything mid-game). Default 216000 = 1 h; 0 = never.
+#EDEN_NX2_EVICT_PIPELINE_FRAMES=216000
